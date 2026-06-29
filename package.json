@@ -1,6 +1,6 @@
 {
   "name": "@propeller-commerce/propeller-v2-mollie",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Mollie PSP payment provider for the Propeller eCommerce V2 platform — drives Mollie payments through the Propeller GraphQL API via @propeller-commerce/propeller-sdk-v2. Server-side, framework-agnostic.",
   "main": "dist/cjs/index.js",
   "module": "dist/esm/index.js",

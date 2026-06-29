@@ -6,6 +6,23 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 once it reaches 1.0. Until then (the `0.x` line) the public API may change
 between minor versions.
 
+## [0.2.2] - 2026-06-29
+
+### Fixed
+
+- **`createMollieClient` import now works under native Node ESM.** The ESM build
+  imported the Mollie client via a default import
+  (`import createMollieClient from '@mollie/api-client'`). `@mollie/api-client`
+  is CommonJS, so under raw Node ESM the CJS→ESM interop binds the default to the
+  whole `module.exports` object rather than the function — `createMollieClient(…)`
+  then threw `createMollieClient is not a function` at payment-create / webhook /
+  status-lookup time. Bundled hosts (e.g. Next.js) normalize the interop and
+  never hit this; a native-ESM host (a Node SSR server such as propeller-vue's
+  `server.js`) does. Switched to the equivalent **named** import
+  (`import { createMollieClient } from '@mollie/api-client'`), which the package
+  also exports and which survives the interop intact — fixing native-ESM hosts
+  without affecting bundled ones. No API change.
+
 ## [0.2.1] - 2026-06-26
 
 ### Changed
