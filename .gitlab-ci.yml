@@ -1,0 +1,231 @@
+# CI for @propeller-commerce/propeller-v2-mollie.
+#
+# Four stages:
+#
+#   verify   — the package's own checks. Fast, no external dependencies:
+#              typecheck, the Jest unit suite (with coverage), and a
+#              production build. This is the hard gate for everything below.
+#
+#   mirror   — one-way force-push of master to the public GitHub mirror so the
+#              package can be consumed via a `github:` dependency URL. Runs only
+#              on master, only after verify passes.
+#
+#   release  — cut a GitHub Release from the CHANGELOG, driven from GitLab (the
+#              source of truth). Idempotent + CHANGELOG-gated.
+#
+#   publish  — publish to the public npm registry. Idempotent (skips if the
+#              version is already on npm) + CHANGELOG-gated, with a tarball
+#              hygiene check that the `files` allowlist holds.
+#
+# Required GitLab CI/CD variables (Settings -> CI/CD -> Variables). Mark the
+# secrets "Masked" and "Protected":
+#
+#   GITHUB_TOKEN   GitHub PAT with `repo` scope — used by the mirror + release
+#                  jobs (push to the mirror, create the Release via the API).
+#   NPM_TOKEN      npm automation token with publish rights for the
+#                  @propeller-commerce scope — used by the publish job.
+
+stages:
+  - verify
+  - mirror
+  - release
+  - publish
+
+default:
+  image: node:20
+
+# Cache npm's global download cache across jobs/pipelines.
+cache:
+  key:
+    files:
+      - package-lock.json
+  paths:
+    - .npm/
+
+.npm_setup: &npm_setup
+  - npm config set cache .npm --location project
+  - npm ci
+
+# -- Stage: verify ------------------------------------------------------------
+
+typecheck:
+  stage: verify
+  before_script: *npm_setup
+  script:
+    - npm run typecheck
+
+unit-tests:
+  stage: verify
+  before_script: *npm_setup
+  script:
+    - npm run test:ci
+  coverage: '/All files\s*\|\s*([0-9.]+)/'
+  artifacts:
+    when: always
+    paths:
+      - coverage/
+    expire_in: 1 week
+
+build:
+  stage: verify
+  before_script: *npm_setup
+  script:
+    - npm run build
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 day
+
+# -- Stage: mirror ------------------------------------------------------------
+# One-way mirror of master to the public GitHub repo so the package can be
+# consumed via a `github:` dependency URL.
+#
+# Master-only and force-push: the mirror force-pushes HEAD to GitHub's master,
+# so running on develop pipelines would overwrite GitHub master with develop
+# state on every develop push. `when: on_success` (default) means GitHub only
+# ever receives commits that passed verify.
+#
+# Requires CI/CD variable GITHUB_TOKEN (repo scope), Masked + Protected.
+
+mirror_to_github:
+  stage: mirror
+  image:
+    name: alpine/git:latest  # Lightweight and git is pre-installed
+    entrypoint: [""]
+  only:
+    - master
+    - main
+  before_script:
+    - git --version
+  script:
+    - echo "Mirroring to GitHub..."
+    - git config --global user.email "ci@propeller-commerce.com"
+    - git config --global user.name "GitLab CI"
+    - git remote add github https://${GITHUB_TOKEN}@github.com/propeller-commerce/propeller-v2-mollie.git || true
+    # GitLab clones shallow; a shallow history + thin pack against the divergent
+    # GitHub mirror causes "remote unpack failed: index-pack failed". Unshallow
+    # so the full object graph is local, do NOT fetch the GitHub remote (that is
+    # what makes git deltify the pack against objects GitHub may not have), and
+    # push a complete (--no-thin) pack.
+    - git fetch origin --unshallow || git fetch origin || true
+    - git push --no-thin github HEAD:refs/heads/master --force
+    - git push --no-thin github --tags --force
+  when: on_success
+  allow_failure: false
+
+# -- Stage: release -----------------------------------------------------------
+# Automatic GitHub Release, driven from GitLab (the source of truth).
+#
+# Why GitLab-driven and not a GitHub Action: the GitHub repo is a one-way
+# force-pushed mirror. A GitHub Action that creates tags/commits would be
+# clobbered by the next mirror push. So the release is cut here, after the
+# mirror, and pushed to the same GitHub remote.
+#
+# Gate (fires a release ONLY when ALL hold):
+#   * package.json "version" has no matching `v<version>` tag yet on GitHub
+#     (idempotent — safe to run on every push; re-runs are clean no-ops)
+#   * the CHANGELOG.md section for that version is NOT marked "Unreleased"
+#
+# Reuses GITHUB_TOKEN (`repo` scope) for the Releases API.
+release_to_github:
+  stage: release
+  image:
+    name: alpine/git:latest  # no node; version parsed with sed/grep
+    entrypoint: [""]
+  only:
+    - master
+    - main
+  needs:
+    - mirror_to_github
+  before_script:
+    - apk add --no-cache jq curl >/dev/null 2>&1 || true
+  script:
+    - echo "Evaluating release gate..."
+    - VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json | head -n1)
+    - 'echo "package.json version: ${VERSION}"'
+    - test -n "$VERSION" || { echo "Could not parse version; aborting."; exit 1; }
+    - TAG="v${VERSION}"
+    - git remote add github https://${GITHUB_TOKEN}@github.com/propeller-commerce/propeller-v2-mollie.git || true
+    - |
+      if git ls-remote --tags github "refs/tags/${TAG}" | grep -q "${TAG}"; then
+        echo "Tag ${TAG} already on GitHub — release already cut, nothing to do.";
+        exit 0;
+      fi
+    - |
+      if grep -Eiq "^##[[:space:]]*\[${VERSION}\][^\n]*unreleased" CHANGELOG.md; then
+        echo "CHANGELOG marks ${VERSION} as Unreleased — skipping release per policy.";
+        exit 0;
+      fi
+    - |
+      awk -v ver="$VERSION" '
+        $0 ~ ("^## [[]" ver "[]]") {grab=1; next}
+        grab && $0 ~ "^## [[]" {exit}
+        grab {print}
+      ' CHANGELOG.md > RELEASE_BODY.md
+    - test -s RELEASE_BODY.md || { echo "Empty CHANGELOG section for ${VERSION}; aborting."; exit 1; }
+    - 'echo "--- release body ---"; cat RELEASE_BODY.md'
+    - git config --global user.email "ci@propeller-commerce.com"
+    - git config --global user.name "GitLab CI"
+    - git tag -a "${TAG}" -m "Release ${TAG}" || true
+    - git push --no-thin github "refs/tags/${TAG}"
+    - |
+      PAYLOAD=$(jq -n --arg tag "$TAG" --arg name "$TAG" \
+        --rawfile body RELEASE_BODY.md \
+        '{tag_name:$tag, name:$name, body:$body, draft:false, prerelease:false}')
+      HTTP=$(curl -sS -o resp.json -w "%{http_code}" -X POST \
+        -H "Authorization: token ${GITHUB_TOKEN}" \
+        -H "Accept: application/vnd.github+json" \
+        https://api.github.com/repos/propeller-commerce/propeller-v2-mollie/releases \
+        -d "$PAYLOAD")
+      echo "GitHub API HTTP ${HTTP}"; cat resp.json
+      case "$HTTP" in 2*) echo "Release ${TAG} created.";; *) echo "Release API call failed."; exit 1;; esac
+  when: on_success
+  allow_failure: true
+
+# -- Stage: publish -----------------------------------------------------------
+# Publish to the public npm registry as @propeller-commerce/propeller-v2-mollie.
+# CHANGELOG-gated + idempotent (skips if the version is already on npm). A
+# hygiene gate asserts the tarball ships only dist/ + docs (the `files`
+# allowlist is the privacy boundary).
+#
+# Unlike the UI packages, this package has NO `prepare` script — `npm ci` does
+# not build dist/. We build explicitly before the pack hygiene check so the
+# dry-run inspects the real tarball. (`npm publish` also runs `prepack` -> build,
+# but the explicit build keeps the hygiene check honest.)
+# Requires CI variable NPM_TOKEN (Masked).
+release_to_npm:
+  stage: publish
+  image: node:20-alpine
+  only:
+    - master
+    - main
+  needs:
+    - release_to_github
+  before_script:
+    - apk add --no-cache git >/dev/null 2>&1 || true
+  script:
+    - PKG="@propeller-commerce/propeller-v2-mollie"
+    - VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json | head -n1)
+    - 'echo "package.json version: ${VERSION}"'
+    - test -n "$VERSION" || { echo "Could not parse version; aborting."; exit 1; }
+    - |
+      if grep -Eiq "^##[[:space:]]*\[${VERSION}\][^\n]*unreleased" CHANGELOG.md; then
+        echo "CHANGELOG marks ${VERSION} as Unreleased - skipping npm publish per policy.";
+        exit 0;
+      fi
+    - echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc
+    - |
+      if npm view "${PKG}@${VERSION}" version >/dev/null 2>&1; then
+        echo "${PKG}@${VERSION} already published - nothing to do.";
+        exit 0;
+      fi
+    - npm ci
+    - npm run build
+    - |
+      echo "Asserting tarball ships no private files...";
+      LEAK=$(npm pack --dry-run --json | grep -iE '"path".*(\.claude|memory|MEMORY|CLAUDE|\.env|/src/)' || true);
+      if [ -n "$LEAK" ]; then echo "PRIVATE FILE IN TARBALL - aborting:"; echo "$LEAK"; exit 1; fi;
+      echo "Tarball clean.";
+    - npm publish --access public
+  when: on_success
+  allow_failure: true

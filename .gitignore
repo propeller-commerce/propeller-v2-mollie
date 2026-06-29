@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+/dist
+
+# IDE and editor folders
+/.cursor
+/.vscode
+/.idea
+/.claude
+
+# Testing
+coverage/
+*.log
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# TypeScript
+*.tsbuildinfo
+tsconfig.tsbuildinfo
