@@ -11,7 +11,15 @@
  * key once at construction from `testMode`.
  */
 
-import createMollieClient, { type MollieClient, PaymentMethod } from '@mollie/api-client';
+// Named import (not default). `@mollie/api-client` is a CommonJS package whose
+// default export is the `createMollieClient` function. Under a bundler (e.g.
+// Next.js) a default import is normalized correctly, but under raw Node ESM the
+// CJS→ESM interop binds the default to the whole `module.exports` object, so
+// `createMollieClient(...)` throws "is not a function". The package also exports
+// `createMollieClient` as a NAMED export, which survives the interop intact — so
+// import it by name to work in both bundled and native-ESM hosts (the Node SSR
+// server in propeller-vue is the latter).
+import { createMollieClient, type MollieClient, PaymentMethod } from '@mollie/api-client';
 import type { MollieProviderConfig } from '../types';
 import type { MollieMethod } from './methodMap';
 import type { MolliePaymentSnapshot } from './statusLadder';
