@@ -6,6 +6,15 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 once it reaches 1.0. Until then (the `0.x` line) the public API may change
 between minor versions.
 
+## [0.2.4] - 2026-07-22
+
+### Changed
+
+- Widen the `@propeller-commerce/propeller-sdk-v2` peer range from `^0.12.0` to
+  `*`. The strict caret pinned consumers to SDK 0.12.x, so bumping an app to SDK
+  0.13.0 produced an `ERESOLVE` peer conflict. `*` matches the SDK peer the UI
+  packages already declare and stops this package from blocking SDK minor bumps.
+
 ## [0.2.3] - 2026-07-08
 
 ### Changed
