@@ -63,3 +63,78 @@ export async function setPropellerOrderStatus(
 
   return orderService(client).setOrderStatus(input);
 }
+
+/** Operation name of the order lookup; routed to the order-editor key (see below). */
+export const ORDER_TOTAL_OPERATION = 'propellerPspOrderTotal';
+
+const ORDER_TOTAL_QUERY = `query ${ORDER_TOTAL_OPERATION}($orderId: Int!) {
+  order(orderId: $orderId) { id status currency total { net } paymentData { status } }
+}`;
+
+// The SDK's built-in order-editor list, used when the host didn't set its own.
+// Never `passwordResetLink`: it returns the reset link, so under the
+// order-editor key anyone could get one for any account (the SDK dropped it
+// from its default too).
+const SDK_DEFAULT_ORDER_EDITOR_OPERATIONS: ReadonlyArray<string> = [
+  'orderSetStatus',
+  'triggerQuoteSendRequest',
+  'triggerOrderSendConfirm',
+];
+
+/**
+ * Send the order lookup with the order-editor key. The storefront key gets
+ * "Forbidden resource" on `order(orderId)` without a Bearer, and the SDK picks
+ * the key by operation name, so this adds the lookup's (package-unique) name to
+ * the host client's order-editor list. Idempotent; nothing else changes.
+ */
+export function routeOrderLookupToOrderEditorKey(client: GraphQLClient): void {
+  const names = client.getConfig().orderEditorMutations ?? SDK_DEFAULT_ORDER_EDITOR_OPERATIONS;
+  if (!names.includes(ORDER_TOTAL_OPERATION)) {
+    client.updateConfig({ orderEditorMutations: [...names, ORDER_TOTAL_OPERATION] });
+  }
+}
+
+/** What the webhook needs from the Propeller order to tie a payment to it. */
+export interface OrderTotalSnapshot {
+  /** Propeller order status, e.g. UNFINISHED / NEW. */
+  status: string;
+  /** The order's pay status (`paymentData.status`), e.g. PAID; '' when unset. */
+  payStatus: string;
+  currency: string;
+  /** `total.net`: the VAT-inclusive total the shopper pays (SDK naming is inverted). */
+  total: number;
+}
+
+/**
+ * Load the order's status, pay status, currency and VAT-inclusive total. Selects nothing
+ * else (no addresses, no e-mail). Returns null when the order doesn't exist;
+ * throws when the lookup itself fails, so the caller changes nothing.
+ */
+export async function fetchOrderTotal(
+  client: GraphQLClient,
+  orderId: number
+): Promise<OrderTotalSnapshot | null> {
+  const res = await client.execute<{
+    order?: {
+      status?: string;
+      currency?: string;
+      total?: { net?: number };
+      paymentData?: { status?: string | null } | null;
+    } | null;
+  }>({ query: ORDER_TOTAL_QUERY, variables: { orderId }, operationName: ORDER_TOTAL_OPERATION });
+  const order = res.data?.order;
+  if (!order) {
+    if (res.errors?.length) {
+      throw new Error(`Propeller order lookup failed: ${res.errors[0]?.message ?? 'unknown error'}`);
+    }
+    return null;
+  }
+  const total = order.total?.net;
+  if (typeof total !== 'number' || typeof order.currency !== 'string') return null;
+  return {
+    status: String(order.status ?? ''),
+    payStatus: String(order.paymentData?.status ?? ''),
+    currency: order.currency,
+    total,
+  };
+}

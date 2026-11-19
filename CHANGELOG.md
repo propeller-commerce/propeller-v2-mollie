@@ -6,6 +6,64 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 once it reaches 1.0. Until then (the `0.x` line) the public API may change
 between minor versions.
 
+## [0.2.5] - 2026-11-19
+
+### Security
+
+- **`handleWebhook` only acts on a payment that pays the order** (security
+  review #19). It loads the Propeller order (`status`, `currency`,
+  `total.net`) and writes nothing (no payment update, no `orderSetStatus`, no
+  mail / PDF / `deleteCart`) unless Mollie's amount equals the order's
+  VAT-inclusive total in whole cents and the currencies match. Before, a
+  payment of one cent created against any order id set that order to
+  `NEW` / `PAID` with the confirmation mail, and an `open` / `pending` payment
+  cleared its cart. Mismatches and unknown orders return
+  `{ ok: false, error }` and log the payment id, order id and both amounts.
+- The confirmation mail, PDF, confirm event and `deleteCart` now run once per
+  order: only for `paid`, a refund or a chargeback, and only while the order
+  is still `UNFINISHED` (each of those takes it out). Before, they ran on every
+  delivery of a `paid` / `open` / `pending` / refund / chargeback webhook, so a
+  re-delivered webhook, a later refund, or a shopper alternating two payments
+  for one order (`open`, `canceled`, `open`, … replayed at the webhook) sent
+  the confirmation mail again each time, to an address a guest chooses.
+- **A non-paying outcome no longer downgrades a placed order.** Once the
+  Propeller order has left `UNFINISHED`, a `canceled` / `expired` / `failed` /
+  `open` / `pending` payment writes nothing and returns
+  `{ ok: false, error: 'order is already <status>; <status> payment ignored' }`.
+  Before, such a payment for the order's total (for example a second payment
+  someone started for an already paid order and then canceled, or a stray one
+  expiring late) set it back to `UNFINISHED` with pay status `CANCELLED` /
+  `EXPIRED` / …. A `paid` webhook for an order whose pay status is already
+  `PAID` is now a no-op (`ok: true`, nothing written). Refunds and chargebacks
+  are unchanged: a refund appends a `REFUND` transaction and keeps the order
+  `NEW` / `PAID`; a chargeback appends a `CHARGEBACK` transaction and sets the
+  pay status to `CHARGEBACK`; neither re-sends the confirmation. The order
+  lookup now also selects `paymentData { status }`.
+- **The order-lookup fallback no longer elevates `passwordResetLink`.** For a
+  host client without its own `orderEditorMutations`, the package wrote a copy
+  of the old SDK default list onto it, `passwordResetLink` included, so that
+  mutation (which returns the reset link) went out with the order-editor key.
+  The fallback is now `orderSetStatus`, `triggerQuoteSendRequest`,
+  `triggerOrderSendConfirm` plus the lookup's own operation, matching the SDK's
+  new default. A host that lists `passwordResetLink` itself keeps its list.
+
+### Changed
+
+- **Behaviour change: `open` / `pending` no longer send the confirmation or
+  clear the backend cart** (the WordPress plugin did). They only update the
+  payment and the order's pay status; the confirmation mail, PDF, confirm event
+  and cart deletion happen when Mollie reports `paid`. So while a bank
+  transfer (or any other payment) is still open, Propeller sends no
+  confirmation mail and the backend cart is kept. The return page is
+  unaffected: `getPaymentStatus` still reports `open` / `pending` with
+  `settled: false`.
+- The order lookup runs under the order-editor key: on the first webhook the
+  package adds its operation name `propellerPspOrderTotal` to the injected
+  client's `orderEditorMutations` (falling back to the SDK defaults, minus
+  `passwordResetLink`, when the host set none). No host change needed. Hosts
+  must charge `order.total.net` (incl. VAT); a payment of the ex-VAT total
+  (`totalGross`) is now refused.
+
 ## [0.2.4] - 2026-07-22
 
 ### Changed

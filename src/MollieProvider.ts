@@ -19,8 +19,14 @@ import { MollieGateway } from './mollie/client';
 import { resolveMollieMethod } from './mollie/methodMap';
 import { classifyPayment } from './mollie/statusLadder';
 import { createPropellerPayment, updatePropellerPayment } from './propeller/payments';
-import { setPropellerOrderStatus } from './propeller/orders';
-import { toMollieValue } from './propeller/amounts';
+import {
+  setPropellerOrderStatus,
+  fetchOrderTotal,
+  routeOrderLookupToOrderEditorKey,
+} from './propeller/orders';
+import { toMollieValue, toCents, matchesOrderTotal } from './propeller/amounts';
+import { OrderStatus } from './enums';
+import { PaymentStatuses, TransactionTypes } from '@propeller-commerce/propeller-sdk-v2';
 import { consoleLogger, type Logger } from './logger';
 import type {
   MollieProviderConfig,
@@ -112,6 +118,13 @@ export class MollieProvider {
    * Handle a Mollie webhook. Pass the `id` Mollie POSTed. Re-fetches the
    * payment, classifies it, updates the Propeller payment + order. Always
    * resolves (never throws) so the host can unconditionally return 200.
+   *
+   * Changes nothing unless Mollie's amount and currency match the order's
+   * VAT-inclusive total (`order.total.net`); the confirmation mail, PDF and
+   * cart deletion only run while the order is still UNFINISHED and the outcome
+   * changes its status or pay status, so a replay doesn't repeat them. Once
+   * the order is placed, only a paid outcome (a no-op when it's already PAID),
+   * a refund or a chargeback is written; nothing moves it back to UNFINISHED.
    */
   async handleWebhook(molliePaymentId: string): Promise<HandleWebhookResult> {
     if (!molliePaymentId) {
@@ -151,7 +164,71 @@ export class MollieProvider {
         };
       }
 
-      // 3. Update the Propeller payment (+ append transaction). Use Mollie's
+      // 3. Tie the payment to the order before touching either. The payment's
+      //    order id and amount came from the checkout request, so a payment of
+      //    one cent against someone else's order must not mark it PAID / NEW,
+      //    send its confirmation or clear its cart.
+      //    Only a payment of the order's own total, in its currency, counts.
+      routeOrderLookupToOrderEditorKey(this.client);
+      const order = await fetchOrderTotal(this.client, fetched.orderId);
+      if (!order) {
+        this.log('error', `Webhook: payment ${molliePaymentId} points at order ${fetched.orderId}, which was not found; nothing changed`);
+        return {
+          ok: false,
+          paymentId: molliePaymentId,
+          orderId: fetched.orderId,
+          mollieStatus: fetched.snapshot.status,
+          error: 'order not found',
+        };
+      }
+      if (!matchesOrderTotal(toCents(fetched.amount), fetched.currency, order.total, order.currency)) {
+        this.log(
+          'error',
+          `Webhook: payment ${molliePaymentId} (${fetched.amount} ${fetched.currency}) does not match the total of order ${fetched.orderId} (${order.total} ${order.currency}); order and payment left unchanged`
+        );
+        return {
+          ok: false,
+          paymentId: molliePaymentId,
+          orderId: fetched.orderId,
+          mollieStatus: fetched.snapshot.status,
+          error: 'amount does not match the order total',
+        };
+      }
+
+      // 4. A placed order (no longer UNFINISHED) can't be reopened by a payment.
+      //    A canceled/expired/failed/open/pending outcome (e.g. a second payment
+      //    someone started for the same order at its total, then abandoned)
+      //    writes nothing, and a paid replay on a PAID order is a no-op.
+      //    Refunds and chargebacks still apply.
+      const placed = order.status.toUpperCase() !== OrderStatus.UNFINISHED;
+      if (placed && outcome.orderStatus === OrderStatus.UNFINISHED) {
+        this.log(
+          'warn',
+          `Webhook: payment ${molliePaymentId} is ${fetched.snapshot.status} but order ${fetched.orderId} is already ${order.status}; nothing changed`
+        );
+        return {
+          ok: false,
+          paymentId: molliePaymentId,
+          orderId: fetched.orderId,
+          mollieStatus: fetched.snapshot.status,
+          error: `order is already ${order.status}; ${fetched.snapshot.status} payment ignored`,
+        };
+      }
+      if (
+        placed &&
+        outcome.transactionType === TransactionTypes.PAY &&
+        order.payStatus.toUpperCase() === PaymentStatuses.PAID
+      ) {
+        this.log('info', `Webhook: order ${fetched.orderId} is already PAID; ${molliePaymentId} needs no update`);
+        return {
+          ok: true,
+          paymentId: molliePaymentId,
+          orderId: fetched.orderId,
+          mollieStatus: fetched.snapshot.status,
+        };
+      }
+
+      // 5. Update the Propeller payment (+ append transaction). Use Mollie's
       //    authoritative amount/currency, not a client-supplied value.
       await updatePropellerPayment(this.client, {
         paymentId: molliePaymentId,
@@ -162,12 +239,20 @@ export class MollieProvider {
         transactionStatus: outcome.transactionStatus,
       });
 
-      // 4. Update the Propeller order status (+ confirm/clear-cart on fulfil).
+      // 6. Update the Propeller order status. The confirmation mail, PDF, event
+      //    and cart deletion run only while the order is UNFINISHED and the
+      //    outcome changes it (out of UNFINISHED, or to another pay status), so
+      //    a replayed webhook or a later refund doesn't send the confirmation
+      //    again. Only paid, refund and chargeback fulfil (not open/pending, see
+      //    the ladder), and each takes the order out of UNFINISHED: once per order.
+      const changesOrder =
+        outcome.orderStatus !== OrderStatus.UNFINISHED ||
+        order.payStatus.toUpperCase() !== outcome.paymentStatus;
       await setPropellerOrderStatus(this.client, {
         orderId: fetched.orderId,
         orderStatus: outcome.orderStatus,
         payStatus: outcome.paymentStatus,
-        fulfil: outcome.deleteCart,
+        fulfil: outcome.deleteCart && !placed && changesOrder,
       });
 
       this.log(
@@ -235,9 +320,9 @@ export class MollieProvider {
  * "add to cart" silently reuse the same un-finalized order). `failed` /
  * `canceled` / `expired` also return false so the shopper can retry.
  *
- * Note: this is the CLIENT/return-page rule and is intentionally distinct from
- * the WEBHOOK's `deleteCart` in `statusLadder.ts`, which is a faithful port of
- * the WordPress plugin and clears the *backend* cart on open/pending too.
+ * Note: this is the CLIENT/return-page rule and is distinct from the WEBHOOK's
+ * `deleteCart` in `statusLadder.ts`, the server-side rule for the *backend*
+ * cart. Both keep the cart on open/pending.
  *
  * Exported for testing and for hosts that want the same rule without a network
  * round-trip.

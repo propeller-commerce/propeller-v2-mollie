@@ -40,3 +40,26 @@ export function toMollieValue(value: string | number): string {
   }
   return major.toFixed(2);
 }
+
+/**
+ * Whether a PSP amount pays a Propeller order total.
+ *
+ * `paidCents` is what the PSP actually collected (integer cents). `orderTotal`
+ * is the order's `total.net` (VAT-inclusive, major units). Propeller keeps up
+ * to four decimals (e.g. `13.3947`) and a PSP can only charge whole cents, so a
+ * total with sub-cent digits is paid by either neighbouring cent (the host may
+ * round either way); a whole-cent total must match exactly. Compared in integer
+ * hundredths of a cent so float drift can't widen the window.
+ */
+export function matchesOrderTotal(
+  paidCents: number,
+  paidCurrency: string,
+  orderTotal: number,
+  orderCurrency: string
+): boolean {
+  if (!Number.isInteger(paidCents) || !Number.isFinite(orderTotal)) return false;
+  if (!paidCurrency || paidCurrency.trim().toUpperCase() !== (orderCurrency || '').trim().toUpperCase()) {
+    return false;
+  }
+  return Math.abs(paidCents * 100 - Math.round(orderTotal * 10000)) < 100;
+}

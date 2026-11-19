@@ -171,8 +171,9 @@ isSettledStatus('failed'); // false → keep it
 > **Two distinct cart rules.** `isSettledStatus` / `getPaymentStatus().settled`
 > is the **client / return-page** rule for the shopper's **local** cart. The
 > webhook's "clears cart" column below is a **separate, server-side** rule for
-> the **backend** cart — it intentionally clears on `open`/`pending` too. Don't
-> conflate them.
+> the **backend** cart. Both keep the cart on `open`/`pending`: the backend
+> cart is cleared, and the confirmation sent, when the payment is `paid`.
+> Don't conflate them.
 
 ## Status mapping (webhook → Propeller)
 
@@ -182,8 +183,8 @@ Propeller:
 | Mollie state | txn type | txn status | payment status | order status | clears cart |
 |---|---|---|---|---|---|
 | paid (no refund/chargeback) | PAY | SUCCESS | PAID | NEW | ✔ |
-| open | PAY | OPEN | OPEN | UNFINISHED | ✔ |
-| pending | PAY | PENDING | PENDING | UNFINISHED | ✔ |
+| open | PAY | OPEN | OPEN | UNFINISHED | ✗ |
+| pending | PAY | PENDING | PENDING | UNFINISHED | ✗ |
 | failed | PAY | FAILED | FAILED | UNFINISHED | ✗ |
 | expired | PAY | FAILED | EXPIRED | UNFINISHED | ✗ |
 | canceled | PAY | FAILED | CANCELLED | UNFINISHED | ✗ |
@@ -194,6 +195,46 @@ On the "clears cart" rows the package also sends the order confirmation email,
 fires the confirm event, and attaches the order PDF — via a single
 `orderSetStatus` mutation. Amounts are converted from Mollie's decimal string to
 Propeller's integer **cents**; the webhook uses Mollie's authoritative amount.
+
+### The payment must pay the order
+
+Before writing anything, the webhook loads the Propeller order (`id status
+currency total { net } paymentData { status }`) and compares it with what
+Mollie actually collected:
+
+- Mollie's amount must equal the order's VAT-inclusive total `order.total.net`
+  in whole cents (a total with sub-cent digits, e.g. `13.3947`, matches either
+  `13.39` or `13.40`), and the currencies must match.
+- On a mismatch, or when the order can't be found, **nothing is written**: the
+  Propeller payment and order stay as they are (an unpaid order stays
+  `UNFINISHED`, no mail, no PDF, cart kept). The result is `{ ok: false, error }`
+  and one log line with the payment id, order id and both amounts.
+- The confirmation mail, PDF, confirm event and cart deletion run once per
+  order: only for `paid` (or a refund / chargeback), and only while the order
+  is still `UNFINISHED`, which each of those leaves. `open` / `pending` never
+  run them, so a re-delivered webhook, a later refund or a shopper alternating
+  two payments does not send the confirmation again. While a bank transfer is
+  open, Propeller sends no confirmation mail.
+- Once the order has left `UNFINISHED`, a `canceled` / `expired` / `failed` /
+  `open` / `pending` outcome writes nothing (`{ ok: false, error }`): a placed
+  order is never moved back to `UNFINISHED`, even when someone starts a second
+  payment for it at its total and cancels it. A `paid` outcome for an order
+  whose pay status is already `PAID` is a no-op (`{ ok: true }`, nothing
+  written). Refunds and chargebacks still apply: a refund appends a `REFUND`
+  transaction and keeps `NEW` / `PAID`, a chargeback appends a `CHARGEBACK`
+  transaction and sets pay status `CHARGEBACK`, neither with a second
+  confirmation.
+
+So the host's create-payment route must charge exactly `order.total.net`
+(`cart.total.totalNet` before the order exists; **not** `totalGross`, which is
+the ex-VAT amount in the SDK's naming). Take it from the order server-side
+rather than from the request body.
+
+The order lookup needs the order-editor key (the storefront key gets
+`Forbidden resource`). The package adds its lookup's operation name
+(`propellerPspOrderTotal`) to the injected client's `orderEditorMutations`
+list on the first webhook (when the client has no list, to the SDK defaults
+without `passwordResetLink`), so no host change is needed.
 
 This "clears cart" column is the **server-side / backend** cart and is separate
 from the **local** cart rule the return page uses (`isSettledStatus` — see

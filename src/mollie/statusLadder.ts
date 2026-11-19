@@ -2,8 +2,12 @@
  * The Mollie webhook status ladder.
  *
  * Mollie's webhook only sends a payment `id`; we re-fetch the payment and map
- * its state to the Propeller status tuple. This is a faithful port of the
- * `if/elseif` chain in the WordPress plugin's `webhook.php`.
+ * its state to the Propeller status tuple. This is a port of the `if/elseif`
+ * chain in the WordPress plugin's `webhook.php`, with one deliberate change:
+ * `open` / `pending` don't clear the cart or send the confirmation (the plugin
+ * did). They leave the order UNFINISHED, so they could fulfil again and again
+ * when a shopper alternates two payments; only `paid`, a refund or a
+ * chargeback fulfil, and each moves the order out of UNFINISHED.
  *
  * **Branch order matters.** `paid` (without refunds/chargebacks) is decided
  * before the refund/chargeback branches, exactly as the plugin does.
@@ -43,10 +47,10 @@ export interface PropellerStatusOutcome {
 /**
  * Classify a Mollie payment into the Propeller status tuple.
  *
- * Mirrors `webhook.php` exactly:
+ * Mirrors `webhook.php`, except open/pending (see above):
  *  - paid (no refund/chargeback) → PAID / NEW, clear cart
- *  - open                        → OPEN / UNFINISHED, clear cart
- *  - pending                     → PENDING / UNFINISHED, clear cart
+ *  - open                        → OPEN / UNFINISHED
+ *  - pending                     → PENDING / UNFINISHED
  *  - failed                      → FAILED / UNFINISHED
  *  - expired                     → EXPIRED / UNFINISHED
  *  - canceled                    → CANCELLED / UNFINISHED
@@ -79,7 +83,7 @@ export function classifyPayment(
       transactionStatus: TransactionStatuses.OPEN,
       paymentStatus: PaymentStatuses.OPEN,
       orderStatus: OrderStatus.UNFINISHED,
-      deleteCart: true,
+      deleteCart: false,
     };
   }
 
@@ -89,7 +93,7 @@ export function classifyPayment(
       transactionStatus: TransactionStatuses.PENDING,
       paymentStatus: PaymentStatuses.PENDING,
       orderStatus: OrderStatus.UNFINISHED,
-      deleteCart: true,
+      deleteCart: false,
     };
   }
 

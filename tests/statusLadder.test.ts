@@ -20,20 +20,20 @@ describe('classifyPayment — the webhook status ladder', () => {
     expect(out.deleteCart).toBe(true);
   });
 
-  it('open → OPEN / UNFINISHED, fulfil', () => {
+  it('open → OPEN / UNFINISHED, no fulfil', () => {
     const out = classifyPayment(snap({ status: 'open' }))!;
     expect(out.transactionStatus).toBe(TransactionStatuses.OPEN);
     expect(out.paymentStatus).toBe(PaymentStatuses.OPEN);
     expect(out.orderStatus).toBe(OrderStatus.UNFINISHED);
-    expect(out.deleteCart).toBe(true);
+    expect(out.deleteCart).toBe(false);
   });
 
-  it('pending → PENDING / UNFINISHED, fulfil', () => {
+  it('pending → PENDING / UNFINISHED, no fulfil', () => {
     const out = classifyPayment(snap({ status: 'pending' }))!;
     expect(out.transactionStatus).toBe(TransactionStatuses.PENDING);
     expect(out.paymentStatus).toBe(PaymentStatuses.PENDING);
     expect(out.orderStatus).toBe(OrderStatus.UNFINISHED);
-    expect(out.deleteCart).toBe(true);
+    expect(out.deleteCart).toBe(false);
   });
 
   it('failed → FAILED / UNFINISHED, no fulfil', () => {
